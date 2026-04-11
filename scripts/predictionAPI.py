@@ -29,8 +29,7 @@ class CarPricePrediction(Resource):
         ('year', str),
         ('km', int),
         ('transmission', str),
-        ('fuel', str),
-        ('class', str)
+        ('fuel', str)
     ]
         for arg_name, arg_type in arguments:
             parser.add_argument(arg_name, type=arg_type, required=True)

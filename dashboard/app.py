@@ -91,17 +91,6 @@ app.layout = html.Div(
                 ),
                 html.Div(
                     children=[
-                        html.Div(children="Class", className="menu-title"),
-                        dcc.Dropdown(
-                            id="class-selector",
-                            value="class",
-                            clearable=True,
-                            className="dropdown",
-                        ),
-                    ],
-                ),
-                html.Div(
-                    children=[
                         html.Div(children="Model year", className="menu-title"),
                         dcc.Dropdown(
                             id="year-selector",
@@ -245,21 +234,6 @@ def filter_brands(brand):
 
 
 @app.callback(
-    Output(component_id='class-selector', component_property='options'),
-    Input(component_id='brand-selector', component_property='value'),
-    Input(component_id='model-selector', component_property='value')
-)
-def filter_class(brand, model):
-    options = [
-        {
-            "label": car_class.capitalize().title(),
-            "value": car_class.capitalize(),
-        }
-        for car_class in features.query(f"brand == @brand and model == @model")['class_new'].sort_values().unique()
-    ]
-    return options
-
-@app.callback(
     Output('price-section', 'children'),
 
     inputs=dict(n_clicks=Input('predict-button', 'n_clicks')),
@@ -268,10 +242,9 @@ def filter_class(brand, model):
     year =State('year-selector', 'value'),
     km=State('km', 'value'),
     transmission=State('transmission-selector', 'value'),
-    fuel=State('fuel-selector', 'value'),
-    class_name=State('class-selector', 'value'),)
+    fuel=State('fuel-selector', 'value'),)
 )
-def predict_price(n_clicks, brand, model, year, km, transmission, fuel,  class_name):
+def predict_price(n_clicks, brand, model, year, km, transmission, fuel):
     if n_clicks is not None:
         
 
@@ -281,8 +254,7 @@ def predict_price(n_clicks, brand, model, year, km, transmission, fuel,  class_n
         'year': year,
         'km': km,
         'transmission':transmission ,
-        'fuel': fuel,
-        'class':class_name
+        'fuel': fuel
     }
 
         response = requests.post(API_URL, json=input_data)
