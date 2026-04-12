@@ -49,6 +49,25 @@ def get_int_query_param(name: str, default: int, minimum: int = 1) -> tuple[int,
     return value, None
 
 
+def get_int_query_param_from_names(
+    names: list[str],
+    default: int,
+    minimum: int = 1,
+) -> tuple[int, str | None]:
+    for name in names:
+        raw_value = request.args.get(name, "").strip()
+        if not raw_value:
+            continue
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return default, f"{name} must be a valid integer"
+        if value < minimum:
+            return default, f"{name} must be at least {minimum}"
+        return value, None
+    return default, None
+
+
 def get_float_query_param(name: str, default: float, minimum: float = 0.0) -> tuple[float, str | None]:
     raw_value = request.args.get(name, "").strip()
     if not raw_value:
@@ -319,9 +338,16 @@ def budget_recommendation():
 
 @app.get("/car-comparison")
 def car_comparison():
-    recommendation_limit, recommendation_limit_error = get_int_query_param("limit", DEFAULT_POPULAR_LIMIT)
-    if recommendation_limit_error:
-        return jsonify({"error": recommendation_limit_error}), 400
+    page_size, page_size_error = get_int_query_param_from_names(
+        ["pageSize", "pageSIze"],
+        DEFAULT_POPULAR_LIMIT,
+    )
+    if page_size_error:
+        return jsonify({"error": page_size_error}), 400
+
+    page_index, page_index_error = get_int_query_param("pageIndex", 0, minimum=0)
+    if page_index_error:
+        return jsonify({"error": page_index_error}), 400
 
     brand, brand_error = get_required_string_query_param("brand")
     if brand_error:
@@ -475,14 +501,15 @@ def car_comparison():
     grouped_recommendations = grouped_recommendations[
         grouped_recommendations["avgPrice"].between(lowest_price, highest_price)
     ]
-    grouped_recommendations = (
-        grouped_recommendations
-        .sort_values(
-            ["model_year", "avgKm", "count", "avgPrice", "brand", "model"],
-            ascending=[False, True, False, True, True, True],
-        )
-        .head(recommendation_limit)
+    grouped_recommendations = grouped_recommendations.sort_values(
+        ["model_year", "avgKm", "count", "avgPrice", "brand", "model"],
+        ascending=[False, True, False, True, True, True],
     )
+    total_recommendations = len(grouped_recommendations)
+    start_index = page_index * page_size
+    end_index = start_index + page_size
+    paged_recommendations = grouped_recommendations.iloc[start_index:end_index]
+    has_next = end_index < total_recommendations
 
     payload = {
         "input": {
@@ -492,7 +519,6 @@ def car_comparison():
             "transmission": transmission,
             "km": km,
             "price": price,
-            "limit": recommendation_limit,
             "sameBrand": same_brand,
             "sameTransmission": same_transmission,
             "sameYear": same_year,
@@ -507,6 +533,12 @@ def car_comparison():
             "highestPrice": highest_price,
         },
         "sellingPriceQualification": selling_price_qualification,
+        "pageInfo": {
+            "total": total_recommendations,
+            "hasNext": has_next,
+            "pageSIze": page_size,
+            "pageIndex": page_index,
+        },
         "vehicleRecommendations": [
             {
                 "brand": row["brand"],
@@ -516,7 +548,7 @@ def car_comparison():
                 "km": int(round(row["avgKm"])),
                 "avgPrice": float(row["avgPrice"]),
             }
-            for _, row in grouped_recommendations.iterrows()
+            for _, row in paged_recommendations.iterrows()
         ],
     }
     return jsonify(payload)
