@@ -22,6 +22,7 @@ SUPPORTED_BUDGET_SORTS = {
     "most_popular",
     "least_popular",
 }
+SUPPORTED_BRAND_SORTS = {"popular", "avgPriceDesc", "avgPriceAsc"}
 SUPPORTED_TRANSMISSIONS = {"automatic", "manual"}
 
 
@@ -228,20 +229,51 @@ def market_insights():
     else:
         brands_limit = None
 
+    sort_brands = request.args.get("sortBrands", "").strip()
+    if sort_brands and sort_brands not in SUPPORTED_BRAND_SORTS:
+        return jsonify(
+            {
+                "error": (
+                    "sortBrands must be one of: "
+                    + ", ".join(sorted(SUPPORTED_BRAND_SORTS))
+                )
+            }
+        ), 400
+
     features = load_market_features()
 
     average_price_by_brand = (
         features.groupby("brand")
-        .agg(avgPrice=("price", "mean"))
-        .sort_values(["avgPrice", "brand"], ascending=[True, True])
+        .agg(avgPrice=("price", "mean"), count=("brand", "size"))
         .reset_index()
     )
+
+    if sort_brands == "popular":
+        average_price_by_brand = average_price_by_brand.sort_values(
+            ["count", "avgPrice", "brand"],
+            ascending=[False, True, True],
+        )
+    elif sort_brands == "avgPriceDesc":
+        average_price_by_brand = average_price_by_brand.sort_values(
+            ["avgPrice", "brand"],
+            ascending=[False, True],
+        )
+    else:
+        average_price_by_brand = average_price_by_brand.sort_values(
+            ["avgPrice", "brand"],
+            ascending=[True, True],
+        )
+
     if brands_limit is not None:
         average_price_by_brand = average_price_by_brand.head(brands_limit)
 
     payload = {
         "averagePriceByBrand": [
-            {"brand": row["brand"], "avgPrice": float(row["avgPrice"])}
+            {
+                "brand": row["brand"],
+                "avgPrice": float(row["avgPrice"]),
+                "count": int(row["count"]),
+            }
             for _, row in average_price_by_brand.iterrows()
         ],
         "mostPopularVehicles": serialize_popular_models(features, limit=vehicle_limit),
