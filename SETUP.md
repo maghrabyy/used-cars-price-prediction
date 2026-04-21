@@ -52,7 +52,7 @@ The API uses relative paths, so start it from the `scripts/` directory:
 
 ```bash
 cd scripts
-flask --app insightsAPI:app run --port 5001
+flask --app insightsAPI:app run --port 5001 --host 0.0.0.0
 ```
 
 Expected URL:
