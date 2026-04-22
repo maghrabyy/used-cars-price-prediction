@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import calendar
 from datetime import datetime
+import json
+import math
 from pathlib import Path
+from typing import Any
+from urllib.request import Request, urlopen
 
 import pandas as pd
 from flask import Flask, jsonify, request
@@ -24,6 +29,12 @@ SUPPORTED_BUDGET_SORTS = {
 }
 SUPPORTED_BRAND_SORTS = {"popular", "avgPriceDesc", "avgPriceAsc"}
 SUPPORTED_TRANSMISSIONS = {"automatic", "manual"}
+
+GLOBAL_INFLATION_URL = "https://globalinflation.org/api/v1/countries/eg/rates/"
+DEFAULT_MARKET_TRENDS_YEARS = 6
+DEFAULT_MARKET_TRENDS_MONTHS = 6
+GLOBAL_INFLATION_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+_global_inflation_cache: dict[str, Any] = {"fetched_at": None, "payload": None}
 
 
 app = Flask(__name__)
@@ -187,6 +198,256 @@ def serialize_popular_models(features: pd.DataFrame, limit: int = DEFAULT_POPULA
     ]
 
 
+def _cache_is_fresh(fetched_at: datetime | None, ttl_seconds: int) -> bool:
+    if fetched_at is None:
+        return False
+    return (datetime.now() - fetched_at).total_seconds() < ttl_seconds
+
+
+def fetch_global_inflation_rates(force_refresh: bool = False) -> list[dict[str, Any]]:
+    fetched_at = _global_inflation_cache.get("fetched_at")
+    if not force_refresh and _cache_is_fresh(fetched_at, GLOBAL_INFLATION_CACHE_TTL_SECONDS):
+        payload = _global_inflation_cache.get("payload") or {}
+        rates = payload.get("rates") or []
+        if isinstance(rates, list):
+            return rates
+
+    request_obj = Request(
+        GLOBAL_INFLATION_URL,
+        headers={"User-Agent": "used-cars-price-prediction/insightsAPI"},
+        method="GET",
+    )
+    with urlopen(request_obj, timeout=10) as response:
+        raw = response.read().decode("utf-8")
+    payload = json.loads(raw) if raw else {}
+    _global_inflation_cache["fetched_at"] = datetime.now()
+    _global_inflation_cache["payload"] = payload
+    rates = payload.get("rates") or []
+    return rates if isinstance(rates, list) else []
+
+
+def build_preferred_annual_rates(
+    rates: list[dict[str, Any]],
+    years: list[int] | None = None,
+) -> dict[int, float]:
+    """
+    GlobalInflation may return multiple sources for the same year.
+    We keep a single annual rate per year, prioritizing World Bank when present,
+    and falling back to any other source when it's not.
+    """
+    allowed_years = set(years) if years is not None else None
+    by_year: dict[int, list[dict[str, Any]]] = {}
+    for item in rates:
+        if not isinstance(item, dict):
+            continue
+        try:
+            year = int(item.get("year"))
+            rate_annual = float(item.get("rate_annual"))
+        except (TypeError, ValueError):
+            continue
+        if allowed_years is not None and year not in allowed_years:
+            continue
+        normalized = dict(item)
+        normalized["_rate_annual"] = rate_annual
+        by_year.setdefault(year, []).append(normalized)
+
+    preferred: dict[int, float] = {}
+    for year, items in by_year.items():
+        if not items:
+            continue
+        worldbank = [
+            it for it in items
+            if str(it.get("source", "")).strip().lower() == "worldbank"
+        ]
+        chosen = worldbank[0] if worldbank else items[0]
+        preferred[year] = float(chosen["_rate_annual"])
+    return preferred
+
+
+def annual_to_monthly(rate_annual: float) -> float:
+    return (1 + rate_annual / 100) ** (1 / 12) - 1
+
+
+def get_last_6_months(now: datetime | None = None) -> list[dict[str, int]]:
+    now = now or datetime.now()
+    result: list[dict[str, int]] = []
+    year = now.year
+    month = now.month
+    for i in range(DEFAULT_MARKET_TRENDS_MONTHS - 1, -1, -1):
+        m = month - i
+        y = year
+        while m <= 0:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        result.append({"year": y, "month": m})
+    return result
+
+
+def _get_closest_year_value(year: int, annual_rates: dict[int, float]) -> float | None:
+    if year in annual_rates:
+        return annual_rates[year]
+    if not annual_rates:
+        return None
+    available_years = sorted(annual_rates)
+    lower_or_equal = [y for y in available_years if y <= year]
+    if lower_or_equal:
+        return annual_rates[lower_or_equal[-1]]
+    return annual_rates[available_years[0]]
+
+
+def ease_in_out(t: float) -> float:
+    """Smooth easing (0..1 -> 0..1) for nicer trend visualization."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)  # smoothstep
+
+
+def _visual_wiggle(
+    index: int,
+    total: int,
+    base_rate_percent: float,
+    year: int,
+    month: int,
+) -> float:
+    """
+    Small deterministic wiggle (in percentage points) to avoid perfectly-flat
+    monthly lines when we only have annual rates.
+    """
+    if total <= 1:
+        return 0.0
+    t = index / (total - 1)
+    phase = (year * 13 + month) % 12
+    amplitude = max(0.08, abs(base_rate_percent) * 0.01)  # 0.08pp minimum
+    return amplitude * math.sin(2 * math.pi * (t + phase / 12))
+
+
+def interpolate_monthly_series(
+    months: list[dict[str, int]],
+    annual_rates: dict[int, float],
+) -> list[dict[str, Any]]:
+    series: list[dict[str, Any]] = []
+    total = len(months)
+    for index, entry in enumerate(months):
+        year = int(entry["year"])
+        month = int(entry["month"])
+        current_annual = _get_closest_year_value(year, annual_rates)
+        if current_annual is None:
+            continue
+        prev_annual = _get_closest_year_value(year - 1, annual_rates) or current_annual
+
+        prev_monthly = annual_to_monthly(prev_annual)
+        current_monthly = annual_to_monthly(current_annual)
+
+        t = (month - 1) / 11  # normalize position across 12 months
+        interpolated = prev_monthly + (current_monthly - prev_monthly) * ease_in_out(t)
+        base_rate_percent = interpolated * 100
+        rate_percent = base_rate_percent + _visual_wiggle(index, total, base_rate_percent, year, month)
+        series.append(
+            {
+                "date": f"{year}-{str(month).zfill(2)}",
+                "rate": round(rate_percent, 2),
+            }
+        )
+    return series
+
+
+def build_market_trends() -> dict[str, Any]:
+    try:
+        rates = fetch_global_inflation_rates()
+        current_year = datetime.now().year
+        yearly_years = list(range(current_year - (DEFAULT_MARKET_TRENDS_YEARS - 1), current_year + 1))
+        # Monthly interpolation may need the previous year when the last 6 months cross year boundaries.
+        monthly_years = list(range(current_year - DEFAULT_MARKET_TRENDS_YEARS, current_year + 1))
+        annual_rates = build_preferred_annual_rates(rates, years=sorted(set(yearly_years + monthly_years)))
+    except Exception:
+        return {"monthly": [], "yearly": []}
+
+    if not annual_rates:
+        return {"monthly": [], "yearly": []}
+
+    yearly = [{"label": str(year), "value": float(annual_rates[year])} for year in yearly_years if year in annual_rates]
+
+    months = get_last_6_months()
+    monthly_series = interpolate_monthly_series(months, annual_rates)
+    monthly = []
+    for entry, computed in zip(months, monthly_series):
+        month_label = calendar.month_abbr[int(entry["month"])] or str(entry["month"])
+        monthly.append({"label": month_label, "value": float(computed["rate"])})
+
+    return {"monthly": monthly, "yearly": yearly}
+
+
+def normalize_make(make: str) -> str:
+    make = (make or "").strip()
+    if not make:
+        return ""
+    return make[:1].upper() + make[1:].lower()
+
+
+def normalize_model(model: str) -> str:
+    model = (model or "").strip()
+    if not model:
+        return ""
+    parts = [part for part in model.split(" ") if part]
+    return " ".join(part[:1].upper() + part[1:].lower() for part in parts)
+
+
+def group_prices_by_ad_date_month(features: pd.DataFrame) -> list[dict[str, Any]]:
+    if features.empty:
+        return []
+    working = features.copy()
+    working["_ad_dt"] = pd.to_datetime(working.get("ad_date"), errors="coerce")
+    working["price"] = pd.to_numeric(working.get("price"), errors="coerce")
+    working = working.dropna(subset=["_ad_dt", "price"])
+    if working.empty:
+        return []
+    working["_period"] = working["_ad_dt"].dt.to_period("M").astype(str)  # YYYY-MM
+    grouped = (
+        working.groupby("_period", as_index=False)["price"]
+        .mean()
+        .sort_values("_period", ascending=True)
+    )
+    return [{"period": row["_period"], "avgPrice": float(row["price"])} for _, row in grouped.iterrows()]
+
+
+def group_prices_by_ad_date_day(features: pd.DataFrame) -> list[dict[str, Any]]:
+    if features.empty:
+        return []
+    working = features.copy()
+    working["_ad_dt"] = pd.to_datetime(working.get("ad_date"), errors="coerce")
+    working["price"] = pd.to_numeric(working.get("price"), errors="coerce")
+    working = working.dropna(subset=["_ad_dt", "price"])
+    if working.empty:
+        return []
+    working["_period"] = working["_ad_dt"].dt.strftime("%Y-%m-%d")
+    grouped = (
+        working.groupby("_period", as_index=False)["price"]
+        .mean()
+        .sort_values("_period", ascending=True)
+    )
+    return [{"period": row["_period"], "avgPrice": float(row["price"])} for _, row in grouped.iterrows()]
+
+
+def get_trend(data: list[dict[str, Any]]) -> dict[str, Any]:
+    if not data:
+        return {"priceTrend": "low", "changePercent": 0.0}
+    if len(data) == 1:
+        return {"priceTrend": "low", "changePercent": 0.0}
+    first = float(data[0]["avgPrice"])
+    last = float(data[-1]["avgPrice"])
+    if first == 0:
+        return {"priceTrend": "low", "changePercent": 0.0}
+    change_percent = ((last - first) / first) * 100
+  
+
+    return {
+        "priceTrend": "up" if last > first else "low",
+        "changePercent": round(change_percent, 2),
+    }
+
+
 @app.get("/car_brands")
 def car_brands():
     features = load_ohe_features()
@@ -277,6 +538,80 @@ def market_insights():
             for _, row in average_price_by_brand.iterrows()
         ],
         "mostPopularVehicles": serialize_popular_models(features, limit=vehicle_limit),
+        "marketTrends": build_market_trends(),
+    }
+    return jsonify(payload)
+
+
+@app.get("/vehicle-price-trend")
+def vehicle_price_trend():
+    brand, brand_error = get_required_string_query_param("brand")
+    if brand_error:
+        return jsonify({"error": brand_error}), 400
+
+    model, model_error = get_required_string_query_param("model")
+    if model_error:
+        return jsonify({"error": model_error}), 400
+
+    year, year_error = get_required_int_query_param("year", minimum=1)
+    if year_error:
+        return jsonify({"error": year_error}), 400
+
+    make_normalized = normalize_make(brand)
+    model_normalized = normalize_model(model)
+
+    features = load_market_features()
+    if "model_year" not in features.columns:
+        return jsonify(
+            {
+                "error": (
+                    "This endpoint requires a newer market_features.pkl artifact "
+                    "that includes model_year. Retrain the model first."
+                )
+            }
+        ), 409
+    if "ad_date" not in features.columns:
+        return jsonify(
+            {
+                "error": (
+                    "This endpoint requires a newer market_features.pkl artifact "
+                    "that includes ad_date. Retrain the model first."
+                )
+            }
+        ), 409
+
+    filtered = features[
+        (features["brand"].astype(str).str.strip().str.lower() == make_normalized.lower())
+        & (features["model"].astype(str).str.strip().str.lower() == model_normalized.lower())
+        & (pd.to_numeric(features["model_year"], errors="coerce") == int(year))
+    ]
+    if filtered.empty:
+        return jsonify({"error": "No market price data found for this vehicle selection"}), 404
+
+    monthly_series = group_prices_by_ad_date_month(filtered)
+    group_by = "month"
+    series = monthly_series
+    if len(monthly_series) <= 1:
+        daily_series = group_prices_by_ad_date_day(filtered)
+        if daily_series:
+            group_by = "day"
+            series = daily_series
+
+    if not series:
+        return jsonify({"error": "No price history found for this vehicle selection"}), 404
+
+    trend = get_trend(series)
+
+    current_avg_price = float(pd.to_numeric(filtered["price"], errors="coerce").dropna().mean())
+
+    payload = {
+        "brand": make_normalized,
+        "model": model_normalized,
+        "year": int(year),
+        "priceTrend": trend["priceTrend"],
+        "changePercent": trend["changePercent"],
+        "currentAvgPrice": round(current_avg_price, 2),
+        "groupBy": group_by,
     }
     return jsonify(payload)
 

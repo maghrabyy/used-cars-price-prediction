@@ -55,11 +55,18 @@ cd scripts
 flask --app insightsAPI:app run --port 5001 --host 0.0.0.0
 ```
 
-Expected URL:
+Example URLs:
 
 ```text
-http://127.0.0.1:5001/predict_car_price
+http://127.0.0.1:5001/market_insights
+http://127.0.0.1:5001/budget-recommendation?budget=500000
+http://127.0.0.1:5001/car_brands
+http://127.0.0.1:5001/vehicle-price-trend?brand=Nissan&model=Altima&year=2018
 ```
+
+Note: `/market_insights` includes `marketTrends` with Egypt inflation rates sourced from the GlobalInflation API (World Bank series). The `monthly` series is an interpolated approximation derived from annual rates.
+
+`/vehicle-price-trend` derives price trend from the locally generated `models/market_features.pkl` artifact (it needs `model_year` + `ad_date`).
 
 ## Run the dashboard
 

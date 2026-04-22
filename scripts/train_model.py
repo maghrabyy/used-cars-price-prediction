@@ -78,6 +78,10 @@ def build_market_features(df: pd.DataFrame) -> pd.DataFrame:
     market_df["model"] = market_df["model"].fillna("").astype(str).str.strip()
     market_df["transmission"] = market_df["transmission"].fillna("").astype(str).str.strip().str.title()
     market_df["fuel"] = market_df["fuel"].fillna("unknown").astype(str)
+    if "ad_date" not in market_df.columns and "date_posted" in market_df.columns:
+        market_df["ad_date"] = market_df["date_posted"]
+    if "ad_date" in market_df.columns:
+        market_df["ad_date"] = pd.to_datetime(market_df["ad_date"], errors="coerce").dt.strftime("%Y-%m-%d")
     return market_df
 
 
@@ -229,3 +233,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
